@@ -1,0 +1,78 @@
+name: Native ARM64 CP312 source verification
+on:
+  push:
+    branches: [ci/native-arm64-cp312-20261011]
+permissions:
+  contents: read
+jobs:
+  native-source:
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash -el {0}
+    env:
+      NUMBA_THREADING_LAYER: workqueue
+      NUMBA_NUM_THREADS: '2'
+      LLVMLITE_PACKAGE_FORMAT: wheel
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: numba/numba
+          ref: d2227923e59d63b2ed67f891227219bcf6e6d323
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+      - name: Verify exact public source
+        run: |
+          test "$(git -C source rev-parse HEAD)" = "d2227923e59d63b2ed67f891227219bcf6e6d323"
+      - uses: conda-incubator/setup-conda-standalone@00a34805e93a8b640aee5f8a20e8f481ad77e3b4
+        with:
+          channel: bootstrap-win-arm64-round-2-native
+          conda-standalone-version: 26.3.2.post1
+          destination-directory: ${{ runner.temp }}/conda-standalone
+      - name: Native build environment
+        run: |
+          export CONDA_PREFIX="${RUNNER_TEMP}/numba-native"
+          "${CONDA_EXE}" create --prefix "${CONDA_PREFIX}" --yes -c https://repo.anaconda.com/pkgs/main python=3.12 pip setuptools "cmake>=4.2" tbb-devel
+          echo "${CONDA_PREFIX}" >> "${GITHUB_PATH}"
+          echo "${CONDA_PREFIX}/Scripts" >> "${GITHUB_PATH}"
+          echo "${CONDA_PREFIX}/Library/bin" >> "${GITHUB_PATH}"
+          echo "CMAKE_PREFIX_PATH=${CONDA_PREFIX}/Library" >> "${GITHUB_ENV}"
+          echo "CONDA_PREFIX=${CONDA_PREFIX}" >> "${GITHUB_ENV}"
+          echo "PIP_CACHE_DIR=${RUNNER_TEMP}/pip-cache" >> "${GITHUB_ENV}"
+          echo "STAGE=${RUNNER_TEMP}/numba-stage" >> "${GITHUB_ENV}"
+      - name: Build native wheel without retagging
+        run: |
+          mkdir -p "$STAGE"
+          python -c "import sysconfig,sys; assert sysconfig.get_platform()=='win-arm64'; assert sys.version_info[:2]==(3,12)"
+          "${CONDA_EXE}" list --prefix "$CONDA_PREFIX" --explicit > "$STAGE/conda-explicit.txt"
+          python -m pip install build wheel delvewheel pefile numpy==2.5.1 llvmlite==0.50.0
+          cd source
+          python -m build --wheel --no-isolation
+          cp dist/*.whl "$STAGE/"
+          python ../harness/native-ci/wheel_audit.py dist "$STAGE/wheel-audit.json"
+          python -m pip install --no-deps dist/*.whl
+      - name: Native default CPU numerical and MCJIT acceptance
+        run: python harness/native-ci/runtime_probe.py "$STAGE/runtime-default.json"
+      - name: Native generic CPU acceptance
+        env:
+          NUMBA_CPU_NAME: generic
+        run: python harness/native-ci/runtime_probe.py "$STAGE/runtime-generic.json"
+      - name: llvmlite installed regression suite
+        if: always()
+        run: python -m llvmlite.tests -v > "$STAGE/llvmlite-tests.txt" 2>&1
+      - name: Dependency metadata check
+        run: python -m pip check
+      - name: Upload evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: numba-native-cp312-evidence
+          path: ${{ runner.temp }}/numba-stage
+          if-no-files-found: error
+          retention-days: 14
